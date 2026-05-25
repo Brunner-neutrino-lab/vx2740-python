@@ -294,17 +294,32 @@ class VX2740Driver:
     def _setup_scope_endpoint(self, n_samples, n_enabled):
         """Allocate buffers for the scope endpoint and register the format.
 
-        set_read_data_format takes a Python list of dicts and does its own
-        JSON encoding internally — do NOT pre-encode with json.dumps.
+        Two non-obvious requirements verified against VX2740B firmware
+        Scope mode:
+
+        1. `/endpoint/par/activeendpoint` must be set to "Scope" before
+           reading. The firmware defaults to "Raw"; if you leave it,
+           scope.read_data() will time out forever because all events
+           land in the raw buffer and the scope buffer stays empty.
+
+        2. The WAVEFORM shape uses the *total* channel count (64),
+           not the number of enabled channels, matching the schema
+           pattern in caen_felib's own device.set_read_data_format
+           example. Disabled channels return empty rows.
+
+        set_read_data_format takes a Python list of dicts and does its
+        own JSON encoding internally — do NOT pre-encode with json.dumps.
         """
+        self._dev.endpoint.par.activeendpoint.value = "Scope"
+
         scope  = self._dev.endpoint.scope
         schema = [
             {"name": "TIMESTAMP",     "type": "U64"},
             {"name": "TRIGGER_ID",    "type": "U32"},
             {"name": "WAVEFORM",      "type": "U16", "dim": 2,
-             "shape": [int(n_enabled), int(n_samples)]},
+             "shape": [int(N_CHANNELS), int(n_samples)]},
             {"name": "WAVEFORM_SIZE", "type": "SIZE_T", "dim": 1,
-             "shape": [int(n_enabled)]},
+             "shape": [int(N_CHANNELS)]},
             {"name": "EVENT_SIZE",    "type": "SIZE_T"},
         ]
         self._scope = scope
@@ -366,8 +381,10 @@ class VX2740Driver:
             ev_wf = np.asarray(wf_buf.value, dtype=np.uint16)
             ev_ts = int(ts_buf.value)
             timestamps.append(ev_ts * tick_s)
-            for row, ch in enumerate(enabled):
-                waves[ch].append(ev_wf[row].copy())
+            # WAVEFORM has all 64 rows (one per channel); index by raw
+            # channel number, not by enabled-list position.
+            for ch in enabled:
+                waves[ch].append(ev_wf[ch].copy())
             collected += 1
 
         result = {ch: np.stack(waves[ch]) for ch in enabled}
