@@ -1,5 +1,5 @@
 numpy
-PyQt5
+nicegui
 matplotlib
 # Hardware mode only (requires CAEN FELib C library installed separately):
 # caen-felib
