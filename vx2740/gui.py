@@ -300,15 +300,40 @@ def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]
                         if c is None: return
                         n = int(n_wf.value)
                         store = bool(store_wf.value)
+                        is_sw = (str(trig_mode.value) == "software")
                         progress_lbl.text = f"acquiring 0 / {n}…"
                         log_msg(f"acquire {n} waveforms (trigger={trig_mode.value}, store={store})")
-                        # Hook progress callback
+                        # Progress callback
                         def _on_prog(done, total):
                             progress_lbl.text = f"acquiring {done} / {total}…"
                         c.on_progress = _on_prog
+
+                        trigger_task = None
                         try:
-                            result = await _in_thread(c.run, n,
-                                                       1000, store, float(timeout_s.value))
+                            if is_sw:
+                                # In software-trigger mode, run() would block forever
+                                # because no events fire on their own. Decompose into
+                                # arm + parallel-trigger-fire + acquire + disarm so the
+                                # acquire read loop sees events arriving from a side
+                                # task that calls sendswtrigger N times.
+                                await _in_thread(c.arm)
+                                async def _fire():
+                                    # Tiny lead so acquire is in its read loop first
+                                    await asyncio.sleep(0.05)
+                                    for _ in range(n):
+                                        await _in_thread(c.send_software_trigger)
+                                        await asyncio.sleep(0.005)
+                                trigger_task = asyncio.create_task(_fire())
+                                try:
+                                    result = await _in_thread(c.acquire, n,
+                                                               1000, store,
+                                                               float(timeout_s.value))
+                                finally:
+                                    await _in_thread(c.disarm)
+                            else:
+                                result = await _in_thread(c.run, n,
+                                                           1000, store,
+                                                           float(timeout_s.value))
                             _own["result"] = result
                             progress_lbl.text = (f"done — {result.n_waveforms} waveforms, "
                                                   f"{sum(len(result.amplitudes.get(ch, [])) for ch in result.channel_ids)} pulses")
@@ -320,6 +345,8 @@ def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]
                             log_msg(f"acquire FAIL: {type(e).__name__}: {e}")
                         finally:
                             c.on_progress = None
+                            if trigger_task is not None and not trigger_task.done():
+                                trigger_task.cancel()
 
                     def send_sw_trig():
                         c = ensure_ctrl()
