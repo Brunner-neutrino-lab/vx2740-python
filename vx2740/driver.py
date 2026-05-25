@@ -19,8 +19,8 @@ import numpy as np
 
 SAMPLE_RATE_HZ   = 125e6          # 125 MS/s
 SAMPLE_PERIOD_NS = 8.0            # ns per sample
-ADC_BITS         = 14
-ADC_FULL_SCALE   = 2**ADC_BITS    # 16384 counts
+ADC_BITS         = 16             # VX2740B is 16-bit (confirmed via /par/adc_nbit)
+ADC_FULL_SCALE   = 2**ADC_BITS    # 65536 counts
 ADC_MIDSCALE     = ADC_FULL_SCALE // 2
 
 N_CHANNELS       = 64             # total channels on VX2740
@@ -198,114 +198,179 @@ class VX2740Driver:
 
     def _connect_hardware(self):
         """
-        Open a connection via CAEN FELib.
-
-        VERIFY with hardware: confirm caen_felib import path and open() call.
-        See: https://www.caen.it/products/caen-felib-library/
+        Open a connection via CAEN FELib using the caen_felib.device API.
         """
         try:
-            import caen_felib.lib as felib
+            from caen_felib import device, error as felib_error
         except ImportError as e:
             raise ImportError(
                 "caen_felib not installed. Install with: pip install caen-felib\n"
                 "Also ensure the CAEN FELib C library is installed on the host."
             ) from e
 
-        self._felib  = felib
-        url          = f"dig2://{self._address}"
-        self._handle = felib.open(url)  # VERIFY: exact function name
+        self._felib_error = felib_error
+        url = f"dig2://{self._address}"
+        self._dev   = device.connect(url)
+        self._scope = None
+        self._data  = None
+        self._data_by_name = {}
 
     def _disconnect_hardware(self):
-        if self._handle is not None:
+        if self._dev is not None:
             try:
                 if self._armed:
                     self._disarm_hardware()
-                self._felib.close(self._handle)  # VERIFY
-            except Exception:
-                pass
+            finally:
+                try:
+                    self._dev.close()
+                except Exception:
+                    pass
+                self._dev   = None
+                self._scope = None
+                self._data  = None
+                self._data_by_name = {}
 
     def _configure_hardware(self, n_samples, pre_samples,
                             channels_enabled, thresholds, trigger_mode):
         """
-        Send configuration SCPI/endpoint commands to the board.
-        VERIFY all parameter paths against VX2740 FELib documentation.
+        Push configuration to the board via the caen_felib.device API.
+
+        Notes
+        -----
+        - Record length and pre-trigger are set in samples ('recordlengths',
+          'pretriggers'); the ns-typed variants ('recordlengtht', 'pretriggert')
+          are derived automatically by the firmware.
+        - Trigger mode 'self' sets AcqTriggerSource = ChSelfTrigger and
+          configures per-channel self-trigger thresholds. 'external' sets
+          AcqTriggerSource = TrgIn (front-panel external trigger input).
         """
-        felib  = self._felib
-        handle = self._handle
+        dev = self._dev
+
+        # Stop any prior acquisition before reconfiguring
+        try:
+            dev.cmd.swstopacquisition()
+            dev.cmd.disarmacquisition()
+        except Exception:
+            pass
 
         # Record window
-        felib.set_value(handle, "/par/RecordLengthS", str(n_samples))      # VERIFY path
-        felib.set_value(handle, "/par/PreTriggerS",   str(pre_samples))     # VERIFY path
+        dev.par.recordlengths.value = str(int(n_samples))
+        dev.par.pretriggers.value   = str(int(pre_samples))
 
-        # Disable all channels first
-        for ch in range(N_CHANNELS):
-            felib.set_value(handle, f"/ch/{ch}/par/ChEnable", "False")     # VERIFY path
+        # Channel enables, thresholds, and self-trigger routing.
+        # In 'self' mode, each enabled channel routes its self-trigger to the
+        # ITLA bus, and the acquisition uses ITLA as its trigger source.
+        # In other modes, channel itlconnect stays Disabled.
+        ch_itl = "ITLA" if trigger_mode == "self" else "Disabled"
+        for ch_idx in range(N_CHANNELS):
+            dev.ch[ch_idx].par.chenable.value   = "False"
+            dev.ch[ch_idx].par.itlconnect.value = "Disabled"
+        for ch_idx in channels_enabled:
+            ch = dev.ch[ch_idx]
+            ch.par.chenable.value   = "True"
+            ch.par.itlconnect.value = ch_itl
+            if ch_idx in thresholds:
+                ch.par.triggerthr.value = str(int(thresholds[ch_idx]))
 
-        # Enable requested channels and set thresholds
-        for ch in channels_enabled:
-            felib.set_value(handle, f"/ch/{ch}/par/ChEnable", "True")      # VERIFY path
-            if ch in thresholds:
-                felib.set_value(handle,
-                                f"/ch/{ch}/par/SelfTriggerThreshold",
-                                str(thresholds[ch]))                        # VERIFY path
-
-        # Trigger source
+        # Acquisition trigger source.
+        # VX2740 scope firmware accepts: TrgIn, SwTrg, ITLA, ITLB, LVDS, UserTrg.
+        # ChSelfTrigger is NOT a valid value here; self-triggering goes via ITLA.
         if trigger_mode == "self":
-            felib.set_value(handle, "/par/AcqTriggerSource",
-                            "ChSelfTrigger")                                # VERIFY value
+            dev.par.acqtriggersource.value = "ITLA"
         elif trigger_mode == "external":
-            felib.set_value(handle, "/par/AcqTriggerSource",
-                            "ExternalTrigger")                              # VERIFY value
+            dev.par.acqtriggersource.value = "TrgIn"
+        elif trigger_mode == "software":
+            dev.par.acqtriggersource.value = "SwTrg"
+        else:
+            raise ValueError(
+                f"Unknown trigger_mode {trigger_mode!r}; "
+                "expected 'self', 'external', or 'software'."
+            )
 
-        # Configure scope endpoint for waveform readout
-        self._ep = felib.get_endpoint(handle, "/endpoint/scope")           # VERIFY path
+        # Configure the scope endpoint with a read-data format that matches
+        # the current set of enabled channels and record length.
+        self._setup_scope_endpoint(n_samples, len(channels_enabled))
+
+    def _setup_scope_endpoint(self, n_samples, n_enabled):
+        """Allocate buffers for the scope endpoint and register the format.
+
+        set_read_data_format takes a Python list of dicts and does its own
+        JSON encoding internally — do NOT pre-encode with json.dumps.
+        """
+        scope  = self._dev.endpoint.scope
+        schema = [
+            {"name": "TIMESTAMP",     "type": "U64"},
+            {"name": "TRIGGER_ID",    "type": "U32"},
+            {"name": "WAVEFORM",      "type": "U16", "dim": 2,
+             "shape": [int(n_enabled), int(n_samples)]},
+            {"name": "WAVEFORM_SIZE", "type": "SIZE_T", "dim": 1,
+             "shape": [int(n_enabled)]},
+            {"name": "EVENT_SIZE",    "type": "SIZE_T"},
+        ]
+        self._scope = scope
+        self._data  = scope.set_read_data_format(schema)
+        self._data_by_name = {d.name: d for d in self._data}
 
     def _arm_hardware(self):
-        felib  = self._felib
-        handle = self._handle
-        felib.send_command(handle, "/cmd/ArmAcquisition")                  # VERIFY
-        felib.send_command(handle, "/cmd/SwStartAcquisition")              # VERIFY
+        # Clear any stale events
+        try:
+            self._dev.cmd.cleardata()
+        except Exception:
+            pass
+        self._dev.cmd.armacquisition()
+        self._dev.cmd.swstartacquisition()
 
     def _disarm_hardware(self):
-        felib  = self._felib
-        handle = self._handle
         try:
-            felib.send_command(handle, "/cmd/SwStopAcquisition")           # VERIFY
-            felib.send_command(handle, "/cmd/DisarmAcquisition")           # VERIFY
+            self._dev.cmd.swstopacquisition()
+        except Exception:
+            pass
+        try:
+            self._dev.cmd.disarmacquisition()
         except Exception:
             pass
 
     def _read_hardware(self, n: int, timeout_s: float) -> dict[int, np.ndarray]:
         """
-        Read n events from the scope endpoint.
-        VERIFY event structure against FELib documentation.
-        """
-        felib = self._felib
-        ep    = self._ep
+        Read n events from the scope endpoint and return raw waveforms.
 
-        waveforms  = {ch: [] for ch in self._channels_enabled}
-        timestamps = []
-        deadline   = time.monotonic() + timeout_s
-        collected  = 0
+        Each call to scope.read_data(timeout_ms, data) blocks until one event
+        arrives (or the per-call timeout elapses).  The WAVEFORM array has
+        shape (n_enabled_channels, n_samples) and rows follow the enabled-
+        channel order, not raw channel indices.
+        """
+        enabled       = self._channels_enabled
+        wf_buf        = self._data_by_name["WAVEFORM"]
+        ts_buf        = self._data_by_name["TIMESTAMP"]
+        # tick-to-second conversion (board clock: 8 ns / count for VX2740)
+        tick_s        = SAMPLE_PERIOD_NS * 1e-9
+
+        per_call_ms   = 100
+        deadline      = time.monotonic() + timeout_s
+        waves         = {ch: [] for ch in enabled}
+        timestamps    = []
+        collected     = 0
 
         while collected < n:
             if time.monotonic() > deadline:
                 raise TimeoutError(
-                    f"Timeout after {timeout_s:.1f}s: collected {collected}/{n} events."
+                    f"Timeout after {timeout_s:.1f}s: "
+                    f"collected {collected}/{n} events."
                 )
             try:
-                evt = felib.read_data(ep, timeout=100)                     # VERIFY API
-                # VERIFY: event structure — assumed dict with 'waveforms' and 'timestamp'
-                ts = evt.get("timestamp", 0.0)
-                timestamps.append(ts)
-                for ch in self._channels_enabled:
-                    raw = evt["waveforms"][ch]                              # VERIFY key
-                    waveforms[ch].append(np.asarray(raw, dtype=np.int16))
-                collected += 1
-            except TimeoutError:
+                self._scope.read_data(per_call_ms, self._data)
+            except self._felib_error.Error:
+                # No event within per_call_ms — keep polling until deadline
                 continue
 
-        result = {ch: np.stack(waveforms[ch]) for ch in self._channels_enabled}
+            ev_wf = np.asarray(wf_buf.value, dtype=np.uint16)
+            ev_ts = int(ts_buf.value)
+            timestamps.append(ev_ts * tick_s)
+            for row, ch in enumerate(enabled):
+                waves[ch].append(ev_wf[row].copy())
+            collected += 1
+
+        result = {ch: np.stack(waves[ch]) for ch in enabled}
         result[-1] = np.array(timestamps, dtype=np.float64)
         return result
 
@@ -343,7 +408,7 @@ class VX2740Driver:
             spe_amplitude = self._sim_spe_amplitudes.get(ch, SIM_SPE_AMPLITUDE_COUNTS)
             noise_sigma   = SIM_NOISE_SIGMA_COUNTS
 
-            waves = np.zeros((n, n_samp), dtype=np.int16)
+            waves = np.zeros((n, n_samp), dtype=np.uint16)
 
             for i in range(n):
                 # Baseline noise
@@ -370,7 +435,7 @@ class VX2740Driver:
 
                 waves[i] = np.clip(
                     baseline + ADC_MIDSCALE, 0, ADC_FULL_SCALE - 1
-                ).astype(np.int16)
+                ).astype(np.uint16)
 
             result[ch] = waves
 
@@ -379,7 +444,7 @@ class VX2740Driver:
 
     def _sim_pmt_waveforms(self, n, n_samp, pre, rng) -> np.ndarray:
         """Generate synthetic PMT trigger pulses on ch4."""
-        waves = np.zeros((n, n_samp), dtype=np.int16)
+        waves = np.zeros((n, n_samp), dtype=np.uint16)
         for i in range(n):
             baseline = rng.normal(0.0, SIM_NOISE_SIGMA_COUNTS * 2, n_samp)
             # PMT pulse at the trigger point
@@ -391,7 +456,7 @@ class VX2740Driver:
             baseline += pulse
             waves[i] = np.clip(
                 baseline + ADC_MIDSCALE, 0, ADC_FULL_SCALE - 1
-            ).astype(np.int16)
+            ).astype(np.uint16)
         return waves
 
     # ------------------------------------------------------------------
