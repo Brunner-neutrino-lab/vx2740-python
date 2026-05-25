@@ -46,7 +46,7 @@ class AcquisitionResult:
     Result of one acquisition block (N waveforms on one or more channels).
 
     Waveform-level data (raw):
-        waveforms[ch]    -> np.ndarray shape (N, n_samples), int16 ADC counts
+        waveforms[ch]    -> np.ndarray shape (N, n_samples), uint16 ADC counts
 
     Pulse-level data (from online pulse finding):
         amplitudes[ch]   -> np.ndarray of pulse amplitudes (ADC counts above baseline)
@@ -254,10 +254,19 @@ class VX2740Controller:
         mode : str
             "self"     — channels self-trigger on threshold crossing
             "external" — external trigger (PMT sync via ch4 or external input)
+            "software" — software trigger via sendswtrigger() (bench testing)
         """
-        if mode not in ("self", "external"):
-            raise ValueError(f"trigger mode must be 'self' or 'external', got {mode!r}")
+        if mode not in ("self", "external", "software"):
+            raise ValueError(
+                f"trigger mode must be 'self', 'external', or 'software', got {mode!r}"
+            )
         self._trigger_mode = mode
+
+    def send_software_trigger(self):
+        """Fire a software trigger (only meaningful in 'software' trigger mode)."""
+        if self._driver._mode != "hardware":
+            return
+        self._driver._dev.cmd.sendswtrigger()
 
     def set_threshold(self, channel: int, threshold_counts: int):
         """Update threshold for a single channel (per_channel mode)."""
