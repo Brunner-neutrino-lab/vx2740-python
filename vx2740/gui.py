@@ -1,38 +1,36 @@
 """
 vx2740/gui.py
 
-Standalone PyQt5 GUI for the CAEN VX2740 digitizer.
+NiceGUI control panel for the CAEN VX2740 digitizer.
 
-Launch directly for independent testing:
-    python -m vx2740.gui
+Same two-mode pattern as b2987b/gui.py:
 
-Or import and embed in the main DAQ window:
-    from vx2740.gui import VX2740Window
+  - Standalone (`python -m vx2740.gui`): opens a browser served by
+    NiceGUI with a Connection panel that creates and owns its own
+    VX2740Controller. Useful for digitizer bring-up without the rest
+    of the DAQ.
+
+  - Embedded (`build_page(get_controller=..., show_connection=False)`):
+    called from a parent NiceGUI app (the ETS DAQ web shell). The
+    parent passes a getter that returns the shared controller; this
+    panel hides its Connection card and drives the parent's
+    controller, so configuration changes here apply to the same
+    instrument used by the rest of the DAQ.
+
+Feature parity with the previous PyQt5 GUI: Connection, Channels
+(threshold mode + per-channel enable/threshold), Acquisition
+(record window + trigger + start/stop), Waveforms (one-trace plot),
+Spectrum (pulse-amplitude histogram).
 """
 
-import sys
+from __future__ import annotations
+
+import asyncio
 import time
-import threading
+from typing import Callable, Optional
+
 import numpy as np
-
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QSpinBox,
-    QDoubleSpinBox, QCheckBox, QTextEdit, QTabWidget, QGridLayout,
-    QSplitter, QTableWidget, QTableWidgetItem, QHeaderView,
-)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt5.QtGui import QFont
-
-# Optional matplotlib for waveform/spectrum plots
-try:
-    import matplotlib
-    matplotlib.use("Qt5Agg")
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.figure import Figure
-    HAS_MPL = True
-except ImportError:
-    HAS_MPL = False
+from nicegui import ui
 
 from .controller import VX2740Controller
 from .driver import (
@@ -42,569 +40,439 @@ from .driver import (
 
 
 # ---------------------------------------------------------------------------
-# Worker signals (thread-safe Qt communication)
+# Style — matches xsphere/DAQ "register" theme
 # ---------------------------------------------------------------------------
 
-class _Signals(QObject):
-    status        = pyqtSignal(str)
-    connected     = pyqtSignal(bool, str)          # (success, message)
-    test_done     = pyqtSignal(bool, str)
-    progress      = pyqtSignal(int, int)           # (acquired, total)
-    acquisition_done  = pyqtSignal(object)         # AcquisitionResult
-    waveform_ready    = pyqtSignal(object, int)    # (waveform np.ndarray, channel)
-
-
-class _ConnectWorker(QThread):
-    def __init__(self, controller: VX2740Controller, signals: _Signals):
-        super().__init__()
-        self._ctrl    = controller
-        self._signals = signals
-
-    def run(self):
-        try:
-            self._ctrl.connect()
-            idn = self._ctrl.identify()
-            self._signals.connected.emit(True, idn)
-        except Exception as e:
-            self._signals.connected.emit(False, str(e))
-
-
-class _AcquireWorker(QThread):
-    def __init__(self, controller: VX2740Controller, n_waveforms: int,
-                 store_waveforms: bool, signals: _Signals):
-        super().__init__()
-        self._ctrl           = controller
-        self._n              = n_waveforms
-        self._store_waveforms = store_waveforms
-        self._signals        = signals
-        self._stop           = threading.Event()
-
-    def stop(self):
-        self._stop.set()
-
-    def run(self):
-        try:
-            self._ctrl.on_progress = lambda a, t: self._signals.progress.emit(a, t)
-            result = self._ctrl.run(
-                n_waveforms     = self._n,
-                store_waveforms = self._store_waveforms,
-            )
-            self._signals.acquisition_done.emit(result)
-        except Exception as e:
-            self._signals.status.emit(f"Acquisition error: {e}")
-        finally:
-            self._ctrl.on_progress = None
+_CSS = """
+:root {
+  --bg:#11151c; --panel:#1b2230; --panel2:#232c3d;
+  --fg:#dde3ee; --mut:#8a93a6;
+  --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff;
+  --line:#2d3648;
+}
+html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
+  font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:0; }
+.pill { padding:.15rem .55rem; border-radius:999px; font-size:.78rem;
+  font-weight:600; white-space:nowrap; display:inline-flex; align-items:center; gap:.3rem; }
+.pill.ok   { background:rgba(63,185,80,.18);  color:var(--ok); }
+.pill.bad  { background:rgba(248,81,73,.18);  color:var(--bad); }
+.pill.warn { background:rgba(210,153,34,.18); color:var(--warn); }
+.pill.mut  { background:rgba(138,147,166,.15);color:var(--mut); }
+.q-card, .vx-card {
+  background:var(--panel) !important; color:var(--fg) !important;
+  border:1px solid var(--line); border-radius:10px;
+  box-shadow:none !important; padding:.55rem .85rem .7rem !important;
+}
+.vx-card h2 { font-size:.92rem; margin:.05rem 0 .45rem; color:var(--acc);
+  font-weight:600; letter-spacing:.3px; }
+.q-btn { background:var(--panel2) !important; color:var(--fg) !important;
+  border:1px solid var(--line) !important; border-radius:6px !important;
+  box-shadow:none !important; padding:.18rem .65rem !important;
+  min-height:32px !important; text-transform:none !important; }
+.q-btn:hover { border-color:var(--acc) !important; }
+.q-btn[data-q-color="primary"], .q-btn.bg-primary {
+  background:var(--acc) !important; color:#08111f !important;
+  border-color:var(--acc) !important; font-weight:600 !important; }
+.q-btn[data-q-color="negative"], .q-btn.bg-negative {
+  background:transparent !important; color:var(--bad) !important;
+  border-color:var(--bad) !important; }
+.q-field__control, .q-field--filled .q-field__control {
+  background:var(--panel2) !important; border:1px solid var(--line) !important;
+  border-radius:6px !important; min-height:32px !important; color:var(--fg) !important; }
+.q-field__label, .q-field__native, .q-field input { color:var(--fg) !important; }
+.q-field__label { color:var(--mut) !important; }
+.q-field--filled .q-field__control:before,
+.q-field--filled .q-field__control:after { display:none !important; }
+.q-tab { color:var(--mut) !important; text-transform:none !important; }
+.q-tab--active { color:var(--acc) !important; }
+.q-tab__indicator { background:var(--acc) !important; }
+.q-log, .nicegui-log { background:var(--panel2) !important; color:var(--fg) !important;
+  border:1px solid var(--line); border-radius:6px;
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.82rem; }
+.vx-ch-row { display:grid; grid-template-columns: 5rem 4rem 9rem; gap:.5rem;
+  align-items:center; padding:.2rem 0; border-top:1px solid var(--line); }
+.vx-ch-row:first-of-type { border-top:0; }
+.num { font-variant-numeric:tabular-nums; }
+"""
 
 
 # ---------------------------------------------------------------------------
-# Main window
+# Helpers
 # ---------------------------------------------------------------------------
 
-class VX2740Window(QMainWindow):
+async def _in_thread(fn, *a, **kw):
+    return await asyncio.to_thread(fn, *a, **kw)
+
+
+def _samples_label(pre_us: float, post_us: float) -> str:
+    n = int(round(pre_us  * SAMPLE_RATE_HZ * 1e-6)) + \
+        int(round(post_us * SAMPLE_RATE_HZ * 1e-6))
+    return f"{n} samples total ({pre_us + post_us:.1f} µs at {SAMPLE_RATE_HZ/1e6:.0f} MS/s)"
+
+
+# ===========================================================================
+# build_page — reusable GUI
+# ===========================================================================
+
+def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]] = None,
+               *, show_connection: Optional[bool] = None) -> None:
     """
-    Standalone window for the CAEN VX2740 digitizer.
+    Render the VX2740 control panel into the current NiceGUI container.
 
-    Tabs:
-        Connection    — IP address, mode, connect/disconnect, test
-        Channels      — enable/disable, per-channel or global threshold
-        Acquisition   — record window, waveform count, trigger mode, start/stop
-        Waveforms     — live waveform plot (last acquisition)
-        Spectrum      — pulse amplitude histogram (last acquisition)
+    Parameters
+    ----------
+    get_controller : callable returning VX2740Controller | None, optional
+        Returns the current shared controller. If `None`, the panel
+        manages its own controller via the Connection card.
+    show_connection : bool, optional
+        Whether to render the Connection card. Defaults to True for
+        standalone (no `get_controller`), False for embedded.
     """
+    if show_connection is None:
+        show_connection = (get_controller is None)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("CAEN VX2740 Digitizer Control")
-        self.resize(900, 700)
+    _own = {"ctrl": None, "result": None}
 
-        self._ctrl:    VX2740Controller | None = None
-        self._signals: _Signals               = _Signals()
-        self._worker:  QThread | None         = None
+    if get_controller is None:
+        def get_controller():
+            return _own["ctrl"]
 
-        self._last_result = None  # most recent AcquisitionResult
+    # --- log + helpers ----------------------------------------------------
 
-        self._build_ui()
-        self._connect_signals()
+    log = ui.log(max_lines=160).classes("h-32 w-full")
+    def log_msg(s: str): log.push(f"[{time.strftime('%H:%M:%S')}] {s}")
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    def ensure_ctrl() -> Optional[VX2740Controller]:
+        c = get_controller()
+        if c is None:
+            log_msg("not connected" + (" — use the Connection tab"
+                                       if show_connection else
+                                       " — connect on the DAQ's Connections tab"))
+            return None
+        return c
 
-    def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+    # --- Tabs -------------------------------------------------------------
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_connection_tab(), "Connection")
-        tabs.addTab(self._build_channels_tab(),   "Channels")
-        tabs.addTab(self._build_acquisition_tab(),"Acquisition")
-        if HAS_MPL:
-            tabs.addTab(self._build_waveform_tab(),  "Waveforms")
-            tabs.addTab(self._build_spectrum_tab(),  "Spectrum")
+    with ui.tabs().classes("w-full") as tabs:
+        t_conn  = ui.tab("connection") if show_connection else None
+        t_chans = ui.tab("channels")
+        t_acq   = ui.tab("acquisition")
+        t_wf    = ui.tab("waveforms")
+        t_spec  = ui.tab("spectrum")
 
-        layout.addWidget(tabs)
-        layout.addWidget(self._build_status_log())
+    initial = t_conn if t_conn is not None else t_chans
+    with ui.tab_panels(tabs, value=initial).classes("w-full"):
 
-    # --- Connection tab ---
-    def _build_connection_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
+        # ----------- Connection (standalone only) -----------
+        if t_conn is not None:
+            with ui.tab_panel(t_conn):
+                with ui.card().classes("vx-card"):
+                    ui.html("<h2>digitizer connection</h2>")
+                    addr_in = ui.input(label="address (IP)",
+                                       value="172.16.0.51").classes("w-72 num")
+                    mode_in = ui.select(["simulation", "hardware"],
+                                        value="simulation",
+                                        label="mode").classes("w-40")
+                    conn_pill = ui.html('<span class="pill mut">disconnected</span>')
 
-        box = QGroupBox("Instrument Connection")
-        g   = QGridLayout(box)
+                    def set_pill(text: str, cls: str):
+                        conn_pill.content = f'<span class="pill {cls}">{text}</span>'
 
-        g.addWidget(QLabel("IP Address:"), 0, 0)
-        self._ip_edit = QLineEdit("192.168.0.1")
-        g.addWidget(self._ip_edit, 0, 1)
+                    async def do_connect():
+                        c = VX2740Controller(address=addr_in.value.strip(),
+                                             mode=mode_in.value)
+                        set_pill("connecting…", "warn")
+                        log_msg(f"connecting to dig2://{addr_in.value.strip()} ({mode_in.value})…")
+                        try:
+                            await _in_thread(c.connect)
+                            _own["ctrl"] = c
+                            set_pill(f"OK — {c.identify()[:60]}", "ok")
+                            log_msg(f"connected: {c.identify()}")
+                        except Exception as e:
+                            set_pill(f"FAIL: {type(e).__name__}", "bad")
+                            log_msg(f"connect FAIL: {type(e).__name__}: {e}")
 
-        g.addWidget(QLabel("Mode:"), 1, 0)
-        self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["simulation", "hardware"])
-        g.addWidget(self._mode_combo, 1, 1)
+                    async def do_disconnect():
+                        c = _own["ctrl"]
+                        if c is None:
+                            return
+                        try:
+                            await _in_thread(c.disconnect)
+                        except Exception as e:
+                            log_msg(f"disconnect warn: {e}")
+                        _own["ctrl"] = None
+                        set_pill("disconnected", "mut")
+                        log_msg("disconnected")
 
-        btn_row = QHBoxLayout()
-        self._connect_btn    = QPushButton("Connect")
-        self._disconnect_btn = QPushButton("Disconnect")
-        self._test_btn       = QPushButton("Test Connection")
-        self._disconnect_btn.setEnabled(False)
-        btn_row.addWidget(self._connect_btn)
-        btn_row.addWidget(self._disconnect_btn)
-        btn_row.addWidget(self._test_btn)
-        g.addLayout(btn_row, 2, 0, 1, 2)
+                    with ui.row().classes("mt-1 gap-2"):
+                        ui.button("connect",    on_click=do_connect).props("color=primary")
+                        ui.button("disconnect", on_click=do_disconnect).props("color=negative flat")
 
-        self._status_label = QLabel("Not connected")
-        self._status_label.setStyleSheet("color: red; font-weight: bold;")
-        g.addWidget(self._status_label, 3, 0, 1, 2)
+        # ----------- Channels tab -----------
+        per_ch_enable: list = []
+        per_ch_thresh: list = []
+        with ui.tab_panel(t_chans):
+            with ui.card().classes("vx-card"):
+                ui.html("<h2>threshold mode</h2>")
+                with ui.row().classes("items-center gap-3"):
+                    thresh_mode = ui.select(["per_channel", "global"],
+                                             value="per_channel",
+                                             label="mode").classes("w-40")
+                    global_thresh = ui.number(label="global (ADC counts)",
+                                              value=150, step=1).classes("w-40 num")
+                global_thresh.bind_visibility_from(thresh_mode, "value",
+                                                    lambda v: v == "global")
 
-        lay.addWidget(box)
-        lay.addStretch()
-        return w
+            with ui.card().classes("vx-card"):
+                ui.html("<h2>SiPM channels (0–3) + PMT (4)</h2>")
+                # Header row
+                ui.html('<div class="vx-ch-row" style="font-weight:600">'
+                        '<span>channel</span><span>enable</span><span>threshold</span></div>')
+                for ch in range(N_SIPM_CHANNELS + 1):
+                    label = f"ch{ch}" + (" (PMT)" if ch == PMT_CHANNEL else " (SiPM)")
+                    with ui.row().classes("vx-ch-row"):
+                        ui.label(label).classes("num text-sm")
+                        chk = ui.switch(value=True)
+                        per_ch_enable.append(chk)
+                        spin = ui.number(value=150, step=1).classes("w-40 num")
+                        # Per-channel thresholds disabled when global mode
+                        spin.bind_enabled_from(thresh_mode, "value",
+                                                lambda v: v == "per_channel")
+                        per_ch_thresh.append(spin)
 
-    # --- Channels tab ---
-    def _build_channels_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
+        # ----------- Acquisition tab -----------
+        with ui.tab_panel(t_acq):
+            with ui.row().classes("w-full gap-3 items-start"):
+                with ui.card().classes("vx-card"):
+                    ui.html("<h2>record window</h2>")
+                    pre_us  = ui.number(label="pre-trigger (µs)",  value=2.0,  step=0.5).classes("w-36 num")
+                    post_us = ui.number(label="post-trigger (µs)", value=10.0, step=1.0).classes("w-36 num")
+                    samples_lbl = ui.label(_samples_label(2.0, 10.0)).classes("num text-xs text-gray-400")
+                    def _update_samples():
+                        samples_lbl.text = _samples_label(float(pre_us.value), float(post_us.value))
+                    pre_us.on("update:model-value", lambda _e: _update_samples())
+                    post_us.on("update:model-value", lambda _e: _update_samples())
 
-        # Threshold mode
-        mode_box = QGroupBox("Threshold Mode")
-        m_lay    = QHBoxLayout(mode_box)
-        self._thresh_mode_combo = QComboBox()
-        self._thresh_mode_combo.addItems(["per_channel", "global"])
-        self._thresh_mode_combo.currentTextChanged.connect(self._on_threshold_mode_changed)
-        m_lay.addWidget(QLabel("Mode:"))
-        m_lay.addWidget(self._thresh_mode_combo)
-        m_lay.addWidget(QLabel("Global threshold (ADC counts):"))
-        self._global_thresh_spin = QSpinBox()
-        self._global_thresh_spin.setRange(0, 8191)
-        self._global_thresh_spin.setValue(150)
-        m_lay.addWidget(self._global_thresh_spin)
-        m_lay.addStretch()
-        lay.addWidget(mode_box)
+                with ui.card().classes("vx-card"):
+                    ui.html("<h2>trigger</h2>")
+                    trig_mode = ui.select(["self", "external", "software"],
+                                          value="external",
+                                          label="source").classes("w-40")
 
-        # Per-channel table
-        ch_box = QGroupBox("SiPM Channels (ch 0–3) + PMT (ch 4)")
-        c_lay  = QVBoxLayout(ch_box)
-        self._ch_table = QTableWidget(N_SIPM_CHANNELS + 1, 3)
-        self._ch_table.setHorizontalHeaderLabels(["Channel", "Enable", "Threshold (ADC counts)"])
-        self._ch_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+                with ui.card().classes("vx-card"):
+                    ui.html("<h2>acquisition</h2>")
+                    n_wf = ui.number(label="waveforms", value=1000, step=100).classes("w-36 num")
+                    store_wf = ui.switch("store raw waveforms (memory-heavy)", value=False)
+                    timeout_s = ui.number(label="timeout (s)", value=60.0, step=10).classes("w-36 num")
+                    progress_lbl = ui.label("ready").classes("num text-sm")
 
-        self._ch_enable_checks  = []
-        self._ch_thresh_spins   = []
+                    async def push_config():
+                        c = ensure_ctrl()
+                        if c is None: return None
+                        # Record window
+                        c.configure_record_window(pre_us=float(pre_us.value),
+                                                  post_us=float(post_us.value))
+                        # Channels + thresholds
+                        sipm_chs = [i for i in range(N_SIPM_CHANNELS)
+                                    if per_ch_enable[i].value]
+                        include_pmt = bool(per_ch_enable[PMT_CHANNEL].value)
+                        if thresh_mode.value == "global":
+                            c.configure_channels(
+                                sipm_channels    = sipm_chs,
+                                threshold_mode   = "global",
+                                global_threshold = int(global_thresh.value),
+                                include_pmt      = include_pmt,
+                            )
+                        else:
+                            thresholds = {i: int(per_ch_thresh[i].value)
+                                          for i in sipm_chs}
+                            c.configure_channels(
+                                sipm_channels    = sipm_chs,
+                                thresholds       = thresholds,
+                                threshold_mode   = "per_channel",
+                                include_pmt      = include_pmt,
+                            )
+                        c.configure_trigger(mode=str(trig_mode.value))
+                        return c
 
-        for row in range(N_SIPM_CHANNELS + 1):
-            ch   = row
-            label = f"ch{ch}" + (" (PMT)" if ch == PMT_CHANNEL else " (SiPM)")
-            self._ch_table.setItem(row, 0, QTableWidgetItem(label))
+                    async def run_acq():
+                        c = await push_config()
+                        if c is None: return
+                        n = int(n_wf.value)
+                        store = bool(store_wf.value)
+                        progress_lbl.text = f"acquiring 0 / {n}…"
+                        log_msg(f"acquire {n} waveforms (trigger={trig_mode.value}, store={store})")
+                        # Hook progress callback
+                        def _on_prog(done, total):
+                            progress_lbl.text = f"acquiring {done} / {total}…"
+                        c.on_progress = _on_prog
+                        try:
+                            result = await _in_thread(c.run, n,
+                                                       1000, store, float(timeout_s.value))
+                            _own["result"] = result
+                            progress_lbl.text = (f"done — {result.n_waveforms} waveforms, "
+                                                  f"{sum(len(result.amplitudes.get(ch, [])) for ch in result.channel_ids)} pulses")
+                            log_msg(progress_lbl.text)
+                            _refresh_wf_controls()
+                            _refresh_plots()
+                        except Exception as e:
+                            progress_lbl.text = "FAIL"
+                            log_msg(f"acquire FAIL: {type(e).__name__}: {e}")
+                        finally:
+                            c.on_progress = None
 
-            chk = QCheckBox()
-            chk.setChecked(True)
-            self._ch_table.setCellWidget(row, 1, chk)
-            self._ch_enable_checks.append(chk)
+                    def send_sw_trig():
+                        c = ensure_ctrl()
+                        if c is None: return
+                        try:
+                            c.send_software_trigger()
+                            log_msg("software trigger sent")
+                        except Exception as e:
+                            log_msg(f"software trigger FAIL: {type(e).__name__}: {e}")
 
-            spin = QSpinBox()
-            spin.setRange(0, 8191)
-            spin.setValue(150)
-            self._ch_table.setCellWidget(row, 2, spin)
-            self._ch_thresh_spins.append(spin)
+                    with ui.row().classes("gap-2 mt-1"):
+                        ui.button("apply config", on_click=push_config)
+                        ui.button("run acquisition", on_click=run_acq).props("color=primary")
+                        ui.button("send SW trigger", on_click=send_sw_trig)
 
-        c_lay.addWidget(self._ch_table)
-        lay.addWidget(ch_box)
-        return w
+        # ----------- Waveforms tab -----------
+        wf_plot = None
+        wf_ax   = None
+        wf_ch_sel = None
+        wf_idx    = None
+        with ui.tab_panel(t_wf):
+            with ui.card().classes("vx-card w-full"):
+                ui.html("<h2>waveform viewer</h2>")
+                with ui.row().classes("items-center gap-2"):
+                    wf_ch_sel = ui.select([f"ch{i}" for i in range(N_SIPM_CHANNELS)],
+                                           value="ch0", label="channel").classes("w-32")
+                    wf_idx = ui.number(label="waveform #", value=0,
+                                       step=1, min=0).classes("w-32 num")
+                wf_plot = ui.matplotlib(figsize=(9, 3.2)).classes("w-full")
+                wf_ax   = wf_plot.figure.add_subplot(111)
+                wf_ax.set_xlabel("time (µs)"); wf_ax.set_ylabel("ADC counts (baseline-subtracted)")
+                wf_ax.grid(True, alpha=.3); wf_plot.figure.tight_layout()
+                wf_ch_sel.on("update:model-value", lambda _e: _refresh_wf_plot())
+                wf_idx.on("update:model-value",    lambda _e: _refresh_wf_plot())
 
-    # --- Acquisition tab ---
-    def _build_acquisition_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
+        def _refresh_wf_controls():
+            r = _own["result"]
+            if r is None: return
+            # Set the upper bound of the waveform index
+            max_idx = max(0, r.n_waveforms - 1)
+            wf_idx.props(f"max={max_idx}")
+            if wf_idx.value > max_idx:
+                wf_idx.value = max_idx
 
-        # Record window
-        rw_box = QGroupBox("Record Window")
-        rw_lay = QGridLayout(rw_box)
-        rw_lay.addWidget(QLabel("Pre-trigger (µs):"), 0, 0)
-        self._pre_spin = QDoubleSpinBox()
-        self._pre_spin.setRange(0.1, 100.0)
-        self._pre_spin.setValue(2.0)
-        self._pre_spin.setSingleStep(0.5)
-        rw_lay.addWidget(self._pre_spin, 0, 1)
-
-        rw_lay.addWidget(QLabel("Post-trigger (µs):"), 1, 0)
-        self._post_spin = QDoubleSpinBox()
-        self._post_spin.setRange(0.1, 100.0)
-        self._post_spin.setValue(10.0)
-        self._post_spin.setSingleStep(1.0)
-        rw_lay.addWidget(self._post_spin, 1, 1)
-
-        self._samples_label = QLabel(f"Total: {DEFAULT_PRE_SAMPLES + DEFAULT_POST_SAMPLES} samples")
-        rw_lay.addWidget(self._samples_label, 2, 0, 1, 2)
-        self._pre_spin.valueChanged.connect(self._update_samples_label)
-        self._post_spin.valueChanged.connect(self._update_samples_label)
-        lay.addWidget(rw_box)
-
-        # Trigger
-        trig_box = QGroupBox("Trigger")
-        t_lay    = QHBoxLayout(trig_box)
-        t_lay.addWidget(QLabel("Trigger source:"))
-        self._trig_combo = QComboBox()
-        self._trig_combo.addItems(["self", "external"])
-        t_lay.addWidget(self._trig_combo)
-        t_lay.addStretch()
-        lay.addWidget(trig_box)
-
-        # Waveform count
-        wf_box = QGroupBox("Acquisition")
-        wf_lay = QGridLayout(wf_box)
-        wf_lay.addWidget(QLabel("Waveforms to acquire:"), 0, 0)
-        self._n_waveforms_spin = QSpinBox()
-        self._n_waveforms_spin.setRange(1, 1_000_000)
-        self._n_waveforms_spin.setValue(1000)
-        wf_lay.addWidget(self._n_waveforms_spin, 0, 1)
-
-        self._store_wf_check = QCheckBox("Store raw waveforms (memory-intensive)")
-        self._store_wf_check.setChecked(False)
-        wf_lay.addWidget(self._store_wf_check, 1, 0, 1, 2)
-
-        # Progress bar (simple label for now)
-        self._progress_label = QLabel("Ready")
-        wf_lay.addWidget(self._progress_label, 2, 0, 1, 2)
-
-        btn_row = QHBoxLayout()
-        self._start_btn = QPushButton("Start Acquisition")
-        self._stop_btn  = QPushButton("Stop")
-        self._start_btn.setEnabled(False)
-        self._stop_btn.setEnabled(False)
-        btn_row.addWidget(self._start_btn)
-        btn_row.addWidget(self._stop_btn)
-        wf_lay.addLayout(btn_row, 3, 0, 1, 2)
-        lay.addWidget(wf_box)
-        lay.addStretch()
-        return w
-
-    # --- Waveform plot tab ---
-    def _build_waveform_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
-
-        ctrl_row = QHBoxLayout()
-        ctrl_row.addWidget(QLabel("Channel:"))
-        self._wf_ch_combo = QComboBox()
-        for ch in range(N_SIPM_CHANNELS):
-            self._wf_ch_combo.addItem(f"ch{ch}")
-        self._wf_ch_combo.currentIndexChanged.connect(self._refresh_waveform_plot)
-        ctrl_row.addWidget(self._wf_ch_combo)
-        ctrl_row.addWidget(QLabel("Waveform index:"))
-        self._wf_idx_spin = QSpinBox()
-        self._wf_idx_spin.setRange(0, 0)
-        self._wf_idx_spin.valueChanged.connect(self._refresh_waveform_plot)
-        ctrl_row.addWidget(self._wf_idx_spin)
-        ctrl_row.addStretch()
-        lay.addLayout(ctrl_row)
-
-        self._wf_fig    = Figure(figsize=(8, 3))
-        self._wf_canvas = FigureCanvas(self._wf_fig)
-        self._wf_ax     = self._wf_fig.add_subplot(111)
-        self._wf_ax.set_xlabel("Time (µs)")
-        self._wf_ax.set_ylabel("ADC counts (baseline subtracted)")
-        self._wf_ax.set_title("Waveform")
-        lay.addWidget(self._wf_canvas)
-        return w
-
-    # --- Spectrum tab ---
-    def _build_spectrum_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
-
-        ctrl_row = QHBoxLayout()
-        ctrl_row.addWidget(QLabel("Channel:"))
-        self._spec_ch_combo = QComboBox()
-        for ch in range(N_SIPM_CHANNELS):
-            self._spec_ch_combo.addItem(f"ch{ch}")
-        self._spec_ch_combo.currentIndexChanged.connect(self._refresh_spectrum_plot)
-        ctrl_row.addWidget(self._spec_ch_combo)
-        ctrl_row.addWidget(QLabel("Bins:"))
-        self._spec_bins_spin = QSpinBox()
-        self._spec_bins_spin.setRange(10, 1000)
-        self._spec_bins_spin.setValue(100)
-        self._spec_bins_spin.valueChanged.connect(self._refresh_spectrum_plot)
-        ctrl_row.addWidget(self._spec_bins_spin)
-        ctrl_row.addStretch()
-        lay.addLayout(ctrl_row)
-
-        self._spec_fig    = Figure(figsize=(8, 3))
-        self._spec_canvas = FigureCanvas(self._spec_fig)
-        self._spec_ax     = self._spec_fig.add_subplot(111)
-        self._spec_ax.set_xlabel("Amplitude (ADC counts)")
-        self._spec_ax.set_ylabel("Counts")
-        self._spec_ax.set_title("Pulse amplitude spectrum")
-        lay.addWidget(self._spec_canvas)
-        return w
-
-    # --- Status log ---
-    def _build_status_log(self) -> QWidget:
-        box = QGroupBox("Status Log")
-        lay = QVBoxLayout(box)
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setMaximumHeight(120)
-        self._log.setFont(QFont("Courier", 9))
-        lay.addWidget(self._log)
-        return box
-
-    # ------------------------------------------------------------------
-    # Signal wiring
-    # ------------------------------------------------------------------
-
-    def _connect_signals(self):
-        self._connect_btn.clicked.connect(self._on_connect)
-        self._disconnect_btn.clicked.connect(self._on_disconnect)
-        self._test_btn.clicked.connect(self._on_test)
-        self._start_btn.clicked.connect(self._on_start_acquisition)
-        self._stop_btn.clicked.connect(self._on_stop_acquisition)
-
-        self._signals.status.connect(self._log_message)
-        self._signals.connected.connect(self._on_connect_result)
-        self._signals.progress.connect(self._on_progress)
-        self._signals.acquisition_done.connect(self._on_acquisition_done)
-
-    # ------------------------------------------------------------------
-    # Slots
-    # ------------------------------------------------------------------
-
-    def _on_connect(self):
-        ip   = self._ip_edit.text().strip()
-        mode = self._mode_combo.currentText()
-        self._ctrl = VX2740Controller(address=ip, mode=mode)
-        self._log_message(f"Connecting to {ip} ({mode} mode)...")
-        self._connect_btn.setEnabled(False)
-
-        worker = _ConnectWorker(self._ctrl, self._signals)
-        worker.start()
-        self._worker = worker
-
-    def _on_connect_result(self, success: bool, message: str):
-        self._connect_btn.setEnabled(True)
-        if success:
-            self._status_label.setText(f"Connected: {message}")
-            self._status_label.setStyleSheet("color: green; font-weight: bold;")
-            self._disconnect_btn.setEnabled(True)
-            self._start_btn.setEnabled(True)
-            self._log_message(f"Connected: {message}")
-        else:
-            self._status_label.setText("Connection failed")
-            self._status_label.setStyleSheet("color: red; font-weight: bold;")
-            self._log_message(f"Connection failed: {message}")
-            self._ctrl = None
-
-    def _on_disconnect(self):
-        if self._ctrl is not None:
+        def _refresh_wf_plot():
+            r = _own["result"]
+            if r is None or wf_ax is None: return
+            ch_str = wf_ch_sel.value
             try:
-                self._ctrl.disconnect()
-            except Exception as e:
-                self._log_message(f"Disconnect error: {e}")
-            self._ctrl = None
-        self._status_label.setText("Not connected")
-        self._status_label.setStyleSheet("color: red; font-weight: bold;")
-        self._disconnect_btn.setEnabled(False)
-        self._start_btn.setEnabled(False)
-        self._log_message("Disconnected.")
-
-    def _on_test(self):
-        config = {
-            "address": self._ip_edit.text().strip(),
-            "mode":    self._mode_combo.currentText(),
-        }
-        self._log_message("Testing connection...")
-
-        class _TestWorker(QThread):
-            done = pyqtSignal(bool, str)
-            def run(self_):
-                ok, msg = VX2740Controller.test(config)
-                self_.done.emit(ok, msg)
-
-        w = _TestWorker(self)
-        w.done.connect(lambda ok, msg: self._log_message(
-            f"Test {'OK' if ok else 'FAILED'}: {msg}"
-        ))
-        w.start()
-        self._worker = w
-
-    def _on_start_acquisition(self):
-        if self._ctrl is None:
-            return
-
-        # Push config from UI to controller
-        self._ctrl.configure_record_window(
-            pre_us  = self._pre_spin.value(),
-            post_us = self._post_spin.value(),
-        )
-        self._ctrl.configure_trigger(self._trig_combo.currentText())
-
-        # Build channel + threshold config from table
-        sipm_chs   = []
-        thresholds = {}
-        for row in range(N_SIPM_CHANNELS):
-            if self._ch_enable_checks[row].isChecked():
-                sipm_chs.append(row)
-                thresholds[row] = self._ch_thresh_spins[row].value()
-
-        thresh_mode = self._thresh_mode_combo.currentText()
-        self._ctrl.configure_channels(
-            sipm_channels     = sipm_chs,
-            thresholds        = thresholds,
-            threshold_mode    = thresh_mode,
-            global_threshold  = self._global_thresh_spin.value(),
-            include_pmt       = self._ch_enable_checks[PMT_CHANNEL].isChecked(),
-        )
-
-        n = self._n_waveforms_spin.value()
-        store = self._store_wf_check.isChecked()
-
-        self._start_btn.setEnabled(False)
-        self._stop_btn.setEnabled(True)
-        self._log_message(f"Starting acquisition: {n} waveforms...")
-
-        acq_worker = _AcquireWorker(self._ctrl, n, store, self._signals)
-        acq_worker.start()
-        self._worker = acq_worker
-
-    def _on_stop_acquisition(self):
-        if self._worker is not None and hasattr(self._worker, "stop"):
-            self._worker.stop()
-        self._stop_btn.setEnabled(False)
-        self._log_message("Stop requested.")
-
-    def _on_progress(self, acquired: int, total: int):
-        pct = 100 * acquired // total
-        self._progress_label.setText(f"Acquired {acquired}/{total} ({pct}%)")
-
-    def _on_acquisition_done(self, result):
-        self._last_result = result
-        self._start_btn.setEnabled(True)
-        self._stop_btn.setEnabled(False)
-
-        total_pulses = sum(len(result.amplitudes.get(ch, [])) for ch in result.channel_ids)
-        self._progress_label.setText(
-            f"Done — {result.n_waveforms} waveforms, {total_pulses} pulses found"
-        )
-        self._log_message(
-            f"Acquisition complete: {result.n_waveforms} waveforms, "
-            f"{total_pulses} total pulses across {len(result.channel_ids)} channels."
-        )
-
-        if HAS_MPL:
-            self._refresh_waveform_plot()
-            self._refresh_spectrum_plot()
-
-    def _on_threshold_mode_changed(self, mode: str):
-        is_global = (mode == "global")
-        self._global_thresh_spin.setEnabled(is_global)
-        for spin in self._ch_thresh_spins:
-            spin.setEnabled(not is_global)
-
-    def _update_samples_label(self):
-        pre  = int(round(self._pre_spin.value()  * SAMPLE_RATE_HZ * 1e-6))
-        post = int(round(self._post_spin.value() * SAMPLE_RATE_HZ * 1e-6))
-        self._samples_label.setText(
-            f"Total: {pre + post} samples  ({pre} pre + {post} post)"
-        )
-
-    # ------------------------------------------------------------------
-    # Plots
-    # ------------------------------------------------------------------
-
-    def _refresh_waveform_plot(self):
-        if not HAS_MPL or self._last_result is None:
-            return
-        result  = self._last_result
-        ch      = self._wf_ch_combo.currentIndex()
-        waveforms = result.waveforms.get(ch)
-        if waveforms is None or len(waveforms) == 0:
-            return
-
-        max_idx = len(waveforms) - 1
-        self._wf_idx_spin.setMaximum(max_idx)
-        idx = min(self._wf_idx_spin.value(), max_idx)
-
-        wave = waveforms[idx].astype(np.float32)
-        wave -= wave[:DEFAULT_PRE_SAMPLES].mean()  # baseline subtract
-        t_us = np.arange(len(wave)) / (SAMPLE_RATE_HZ * 1e-6)
-
-        self._wf_ax.clear()
-        self._wf_ax.plot(t_us, wave, lw=0.8)
-        self._wf_ax.axvline(DEFAULT_PRE_SAMPLES / (SAMPLE_RATE_HZ * 1e-6),
-                            color="red", ls="--", lw=0.8, label="trigger")
-        self._wf_ax.set_xlabel("Time (µs)")
-        self._wf_ax.set_ylabel("ADC counts (baseline sub.)")
-        self._wf_ax.set_title(f"Waveform — ch{ch}, index {idx}")
-        self._wf_ax.legend(fontsize=8)
-        self._wf_fig.tight_layout()
-        self._wf_canvas.draw()
-
-    def _refresh_spectrum_plot(self):
-        if not HAS_MPL or self._last_result is None:
-            return
-        result = self._last_result
-        ch     = self._spec_ch_combo.currentIndex()
-        amps   = result.amplitudes.get(ch)
-        if amps is None or len(amps) == 0:
-            self._log_message(f"No pulses found on ch{ch} for spectrum.")
-            return
-
-        bins = self._spec_bins_spin.value()
-        self._spec_ax.clear()
-        self._spec_ax.hist(amps, bins=bins, color="steelblue", edgecolor="none")
-        self._spec_ax.set_xlabel("Amplitude (ADC counts)")
-        self._spec_ax.set_ylabel("Counts")
-        self._spec_ax.set_title(f"Pulse spectrum — ch{ch}  (N={len(amps)} pulses)")
-        self._spec_fig.tight_layout()
-        self._spec_canvas.draw()
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
-    def _log_message(self, msg: str):
-        ts = time.strftime("%H:%M:%S")
-        self._log.append(f"[{ts}] {msg}")
-
-    def closeEvent(self, event):
-        if self._ctrl is not None:
-            try:
-                self._ctrl.disconnect()
+                ch = int(ch_str.replace("ch", ""))
             except Exception:
-                pass
-        super().closeEvent(event)
+                return
+            waves = r.waveforms.get(ch)
+            if waves is None or len(waves) == 0:
+                wf_ax.clear()
+                wf_ax.text(0.5, 0.5,
+                           "no stored waveforms — enable 'store raw waveforms' and re-run",
+                           ha="center", va="center", color="#8a93a6",
+                           transform=wf_ax.transAxes)
+                wf_plot.update()
+                return
+            i = int(min(int(wf_idx.value), len(waves) - 1))
+            w = np.asarray(waves[i], dtype=np.float64)
+            # Baseline-subtract using first ~25 % of samples
+            n = len(w)
+            base = w[:max(1, n // 4)].mean()
+            t_us = np.arange(n) / SAMPLE_RATE_HZ * 1e6
+            wf_ax.clear()
+            wf_ax.plot(t_us, w - base, lw=1, color="#58a6ff")
+            wf_ax.axvline(float(np.asarray(r.amplitudes.get(ch, [0]))[0] if False else 0),
+                          color="#8a93a6", alpha=0.0)
+            wf_ax.set_xlabel("time (µs)")
+            wf_ax.set_ylabel("ADC counts (baseline-subtracted)")
+            wf_ax.set_title(f"ch{ch}  waveform #{i}")
+            wf_ax.grid(True, alpha=.3)
+            wf_plot.figure.tight_layout()
+            wf_plot.update()
+
+        # ----------- Spectrum tab -----------
+        spec_plot = None
+        spec_ax   = None
+        spec_ch_sel = None
+        spec_bins   = None
+        with ui.tab_panel(t_spec):
+            with ui.card().classes("vx-card w-full"):
+                ui.html("<h2>pulse-amplitude spectrum</h2>")
+                with ui.row().classes("items-center gap-2"):
+                    spec_ch_sel = ui.select([f"ch{i}" for i in range(N_SIPM_CHANNELS)],
+                                             value="ch0", label="channel").classes("w-32")
+                    spec_bins   = ui.number(label="bins", value=100, step=10).classes("w-32 num")
+                spec_plot = ui.matplotlib(figsize=(9, 3.2)).classes("w-full")
+                spec_ax   = spec_plot.figure.add_subplot(111)
+                spec_ax.set_xlabel("amplitude (ADC counts above baseline)")
+                spec_ax.set_ylabel("counts")
+                spec_ax.grid(True, alpha=.3); spec_plot.figure.tight_layout()
+                spec_ch_sel.on("update:model-value", lambda _e: _refresh_spec_plot())
+                spec_bins.on  ("update:model-value", lambda _e: _refresh_spec_plot())
+
+        def _refresh_spec_plot():
+            r = _own["result"]
+            if r is None or spec_ax is None: return
+            try:
+                ch = int(spec_ch_sel.value.replace("ch", ""))
+            except Exception:
+                return
+            amps = np.asarray(r.amplitudes.get(ch, []), dtype=np.float64)
+            spec_ax.clear()
+            if amps.size == 0:
+                spec_ax.text(0.5, 0.5, "no pulses found — try lowering threshold",
+                             ha="center", va="center", color="#8a93a6",
+                             transform=spec_ax.transAxes)
+            else:
+                spec_ax.hist(amps, bins=int(spec_bins.value),
+                             color="#58a6ff", edgecolor="#11151c", linewidth=0.5)
+                spec_ax.set_xlabel("amplitude (ADC counts above baseline)")
+                spec_ax.set_ylabel("counts")
+                spec_ax.set_title(f"ch{ch}  ({amps.size} pulses)")
+            spec_ax.grid(True, alpha=.3)
+            spec_plot.figure.tight_layout()
+            spec_plot.update()
+
+        def _refresh_plots():
+            _refresh_wf_plot()
+            _refresh_spec_plot()
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Standalone entry — `python -m vx2740.gui`
 # ---------------------------------------------------------------------------
 
 def main():
-    app = QApplication(sys.argv)
-    win = VX2740Window()
-    win.show()
-    sys.exit(app.exec_())
+    import argparse
+    p = argparse.ArgumentParser(description="CAEN VX2740 web GUI")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8767)
+    args = p.parse_args()
+
+    @ui.page("/")
+    def index():
+        ui.add_head_html(f"<style>{_CSS}</style>")
+        ui.dark_mode().enable()
+        with ui.element("header").style(
+            "display:flex;align-items:center;gap:.8rem;"
+            "padding:.55rem 1rem;background:var(--panel);"
+            "border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5"
+        ):
+            ui.html("<h1 style='font-size:1.05rem;font-weight:600;margin:0'>"
+                    "VX2740 · digitizer</h1>")
+        build_page()
+
+    ui.run(host=args.host, port=args.port, reload=False,
+           title="VX2740 Digitizer", show=False)
 
 
-if __name__ == "__main__":
+if __name__ in {"__main__", "__mp_main__"}:
     main()
