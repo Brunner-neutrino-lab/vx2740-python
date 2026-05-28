@@ -367,11 +367,20 @@ class VX2740Driver:
         collected     = 0
 
         while collected < n:
+            # Allow an external caller to abort mid-read by setting
+            # self._armed = False (e.g. by calling disarm() from another
+            # thread).  Without this, the loop only exits at deadline,
+            # so a too-high threshold means waiting out the full
+            # timeout — uninterruptable from the GUI.
+            if not self._armed:
+                break
             if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"Timeout after {timeout_s:.1f}s: "
-                    f"collected {collected}/{n} events."
-                )
+                if collected == 0:
+                    raise TimeoutError(
+                        f"Timeout after {timeout_s:.1f}s: "
+                        f"collected {collected}/{n} events."
+                    )
+                break   # partial collection on timeout — let caller decide
             try:
                 self._scope.read_data(per_call_ms, self._data)
             except self._felib_error.Error:
@@ -386,6 +395,15 @@ class VX2740Driver:
             for ch in enabled:
                 waves[ch].append(ev_wf[ch].copy())
             collected += 1
+
+        # Zero events ever arrived (almost always: user aborted with no
+        # triggers fired).  Return an empty-shaped result instead of
+        # raising — the caller (controller.acquire) detects this and
+        # returns a partial AcquisitionResult.
+        if collected == 0:
+            return ({ch: np.zeros((0, self._n_samples), dtype=np.uint16)
+                     for ch in enabled}
+                    | {-1: np.array([], dtype=np.float64)})
 
         result = {ch: np.stack(waves[ch]) for ch in enabled}
         result[-1] = np.array(timestamps, dtype=np.float64)

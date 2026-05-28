@@ -34,7 +34,7 @@ from nicegui import ui
 
 from .controller import VX2740Controller
 from .driver import (
-    N_SIPM_CHANNELS, PMT_CHANNEL,
+    N_CHANNELS, N_SIPM_CHANNELS, PMT_CHANNEL,
     DEFAULT_PRE_SAMPLES, DEFAULT_POST_SAMPLES, SAMPLE_RATE_HZ,
 )
 
@@ -92,6 +92,17 @@ html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
 .vx-ch-row { display:grid; grid-template-columns: 5rem 4rem 9rem; gap:.5rem;
   align-items:center; padding:.2rem 0; border-top:1px solid var(--line); }
 .vx-ch-row:first-of-type { border-top:0; }
+/* 64-channel grid: 8 columns of compact toggles */
+.vx-ch-grid { display:grid; grid-template-columns:repeat(8, minmax(0,1fr));
+  gap:.25rem .35rem; }
+.vx-ch-grid .q-checkbox { padding:.1rem .2rem; }
+.vx-ch-grid .q-checkbox__label { font-family:ui-monospace,Menlo,Consolas,monospace;
+  font-size:.78rem; padding-left:.25rem; min-width:1.6rem; }
+.vx-ch-pmt .q-checkbox__label { color:var(--warn); font-weight:600; }
+/* Per-channel threshold grid (rendered only for enabled channels) */
+.vx-thresh-grid { display:grid; grid-template-columns:repeat(4, minmax(0,1fr));
+  gap:.25rem .5rem; max-height:14rem; overflow-y:auto; padding-right:.3rem; }
+.vx-thresh-grid .q-field { min-height:30px; }
 .num { font-variant-numeric:tabular-nums; }
 """
 
@@ -223,19 +234,91 @@ def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]
                 global_thresh.bind_visibility_from(thresh_mode, "value",
                                                     lambda v: v == "global")
 
-            with ui.card().classes("vx-card"):
-                ui.html("<h2>SiPM channels (0–3) + PMT (4)</h2>")
-                # Header row
-                ui.html('<div class="vx-ch-row" style="font-weight:600">'
-                        '<span>channel</span><span>enable</span><span>threshold</span></div>')
-                for ch in range(N_SIPM_CHANNELS + 1):
-                    label = f"ch{ch}" + (" (PMT)" if ch == PMT_CHANNEL else " (SiPM)")
-                    with ui.row().classes("vx-ch-row"):
-                        ui.label(label).classes("num text-sm")
-                        chk = ui.switch(value=True)
+            with ui.card().classes("vx-card w-full"):
+                ui.html(f"<h2>channels (0–{N_CHANNELS-1})</h2>")
+                ui.label(
+                    f"Toggle any of the {N_CHANNELS} VX2740 channels. "
+                    f"Ch{PMT_CHANNEL} is the conventional PMT input "
+                    "(external-trigger reference); enabling it also flips "
+                    "the include_pmt flag in the controller."
+                ).classes("text-gray-400 text-xs mb-2")
+
+                # ---- Quick-action row ----
+                def _set_all(state: bool) -> None:
+                    for c in per_ch_enable:
+                        c.value = state
+
+                def _invert_all() -> None:
+                    for c in per_ch_enable:
+                        c.value = not c.value
+
+                def _apply_range(spec: str) -> None:
+                    """Parse '0,4,7-12,32-47' and enable those channels (any
+                    not listed get disabled)."""
+                    s = (spec or "").strip()
+                    if not s:
+                        return
+                    selected: set[int] = set()
+                    for part in s.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if "-" in part:
+                            try:
+                                a, b = part.split("-", 1)
+                                lo, hi = int(a), int(b)
+                                if lo > hi: lo, hi = hi, lo
+                                selected.update(range(lo, hi + 1))
+                            except ValueError:
+                                continue
+                        else:
+                            try:
+                                selected.add(int(part))
+                            except ValueError:
+                                continue
+                    selected = {c for c in selected if 0 <= c < N_CHANNELS}
+                    for ch in range(N_CHANNELS):
+                        per_ch_enable[ch].value = (ch in selected)
+
+                with ui.row().classes("items-center gap-2 mb-2 w-full no-wrap"):
+                    ui.button("all",    on_click=lambda: _set_all(True)).props("flat dense")
+                    ui.button("none",   on_click=lambda: _set_all(False)).props("flat dense")
+                    ui.button("invert", on_click=_invert_all).props("flat dense")
+                    range_in = ui.input(placeholder='range, e.g. "0,4,8-15"') \
+                        .props("dense").classes("flex-1 num")
+                    ui.button("apply range",
+                              on_click=lambda: _apply_range(range_in.value)) \
+                        .props("dense")
+
+                # ---- 8×8 enable grid ----
+                ui.html('<div class="vx-ch-grid" id="vx-ch-grid"></div>')   # marker (unused now, kept for css scope)
+                with ui.element("div").classes("vx-ch-grid"):
+                    for ch in range(N_CHANNELS):
+                        # Default enable: ch 0–3 (SiPM) + ch 4 (PMT), matching
+                        # the previous GUI's defaults so anyone who used the
+                        # 5-channel layout sees the same behaviour out of the box.
+                        default_on = ch < (N_SIPM_CHANNELS + 1)
+                        chk = ui.checkbox(text=f"{ch}", value=default_on) \
+                            .props("dense")
+                        if ch == PMT_CHANNEL:
+                            chk.classes("vx-ch-pmt")
                         per_ch_enable.append(chk)
-                        spin = ui.number(value=150, step=1).classes("w-40 num")
-                        # Per-channel thresholds disabled when global mode
+
+                # ---- Per-channel thresholds (rendered only for enabled ch) ----
+                ui.html('<h2 style="margin-top:.8rem">per-channel thresholds</h2>')
+                ui.label(
+                    "Inputs are only visible for currently-enabled channels. "
+                    "In 'global' mode the value above is used everywhere and "
+                    "these inputs are read-only."
+                ).classes("text-gray-400 text-xs mb-2")
+                with ui.element("div").classes("vx-thresh-grid"):
+                    for ch in range(N_CHANNELS):
+                        spin = ui.number(label=f"ch{ch}", value=150, step=1) \
+                            .props("dense") \
+                            .classes("num")
+                        # Visible only if this channel's enable checkbox is on
+                        spin.bind_visibility_from(per_ch_enable[ch], "value")
+                        # Read-only in global mode
                         spin.bind_enabled_from(thresh_mode, "value",
                                                 lambda v: v == "per_channel")
                         per_ch_thresh.append(spin)
@@ -272,9 +355,11 @@ def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]
                         # Record window
                         c.configure_record_window(pre_us=float(pre_us.value),
                                                   post_us=float(post_us.value))
-                        # Channels + thresholds
-                        sipm_chs = [i for i in range(N_SIPM_CHANNELS)
-                                    if per_ch_enable[i].value]
+                        # Channels + thresholds.  configure_channels treats
+                        # `sipm_channels` as "every readout channel except the
+                        # PMT"; ch PMT_CHANNEL is added when include_pmt=True.
+                        sipm_chs = [i for i in range(N_CHANNELS)
+                                    if per_ch_enable[i].value and i != PMT_CHANNEL]
                         include_pmt = bool(per_ch_enable[PMT_CHANNEL].value)
                         if thresh_mode.value == "global":
                             c.configure_channels(
@@ -371,7 +456,7 @@ def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]
             with ui.card().classes("vx-card w-full"):
                 ui.html("<h2>waveform viewer</h2>")
                 with ui.row().classes("items-center gap-2"):
-                    wf_ch_sel = ui.select([f"ch{i}" for i in range(N_SIPM_CHANNELS)],
+                    wf_ch_sel = ui.select([f"ch{i}" for i in range(N_CHANNELS)],
                                            value="ch0", label="channel").classes("w-32")
                     wf_idx = ui.number(label="waveform #", value=0,
                                        step=1, min=0).classes("w-32 num")
@@ -390,6 +475,34 @@ def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]
             wf_idx.props(f"max={max_idx}")
             if wf_idx.value > max_idx:
                 wf_idx.value = max_idx
+            # Auto-select a channel that actually has stored waveforms.
+            # The Waveforms-tab dropdown defaults to "ch0" but the user may
+            # have enabled a completely different set in the Channels tab;
+            # without this, the viewer shows "no stored waveforms" even
+            # though raw waveforms were captured on the enabled channels.
+            channels_with_waves = [
+                ch for ch in r.channel_ids
+                if r.waveforms.get(ch) is not None and len(r.waveforms[ch]) > 0
+            ]
+            channels_with_pulses = [
+                ch for ch in r.channel_ids
+                if len(r.amplitudes.get(ch, [])) > 0
+            ]
+            try:
+                current_ch = int(str(wf_ch_sel.value).replace("ch", ""))
+            except Exception:
+                current_ch = -1
+            preferred = (channels_with_waves or channels_with_pulses or list(r.channel_ids))
+            if current_ch not in channels_with_waves and preferred:
+                wf_ch_sel.value = f"ch{preferred[0]}"
+            # Same for the Spectrum tab's channel selector.
+            try:
+                spec_ch = int(str(spec_ch_sel.value).replace("ch", ""))
+            except Exception:
+                spec_ch = -1
+            spec_preferred = channels_with_pulses or list(r.channel_ids)
+            if spec_ch not in channels_with_pulses and spec_preferred:
+                spec_ch_sel.value = f"ch{spec_preferred[0]}"
 
         def _refresh_wf_plot():
             r = _own["result"]
@@ -434,7 +547,7 @@ def build_page(get_controller: Optional[Callable[[], Optional[VX2740Controller]]
             with ui.card().classes("vx-card w-full"):
                 ui.html("<h2>pulse-amplitude spectrum</h2>")
                 with ui.row().classes("items-center gap-2"):
-                    spec_ch_sel = ui.select([f"ch{i}" for i in range(N_SIPM_CHANNELS)],
+                    spec_ch_sel = ui.select([f"ch{i}" for i in range(N_CHANNELS)],
                                              value="ch0", label="channel").classes("w-32")
                     spec_bins   = ui.number(label="bins", value=100, step=10).classes("w-32 num")
                 spec_plot = ui.matplotlib(figsize=(9, 3.2)).classes("w-full")

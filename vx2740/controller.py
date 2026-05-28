@@ -356,14 +356,24 @@ class VX2740Controller:
         acquired = 0
         while acquired < n_waveforms:
             this_batch = min(batch_size, n_waveforms - acquired)
-            raw = self._driver.read_waveforms(this_batch, timeout_s=timeout_s)
+            try:
+                raw = self._driver.read_waveforms(this_batch, timeout_s=timeout_s)
+            except TimeoutError:
+                # No events at all and timeout fired — bail with whatever
+                # was previously accumulated.
+                break
 
             batch_timestamps = raw.get(-1, np.zeros(this_batch))
+            actual = len(batch_timestamps)
+            if actual == 0:
+                # Disarmed mid-read (Stop button) or driver returned an
+                # empty result.  Stop here; don't keep looping forever.
+                break
 
             for ch in self._sipm_channels:
                 if ch not in raw:
                     continue
-                waves = raw[ch]  # shape (this_batch, n_samples)
+                waves = raw[ch]  # shape (actual, n_samples)
 
                 if store_waveforms:
                     result.waveforms[ch].append(waves)
@@ -375,11 +385,15 @@ class VX2740Controller:
                 result.amplitudes[ch].extend(amps)
                 result.timestamps[ch].extend(ts)
 
-            acquired += this_batch
-            self._total_waveforms += this_batch
+            acquired += actual
+            self._total_waveforms += actual
 
             if self.on_progress is not None:
                 self.on_progress(acquired, n_waveforms)
+
+            # External disarm — break out of the outer loop too.
+            if not self._driver._armed:
+                break
 
         # Consolidate lists to arrays
         for ch in self._sipm_channels:
