@@ -36,6 +36,9 @@ from .driver import (
 )
 
 
+MAX_BASELINE_SAMPLES = int(round(2e-6 * SAMPLE_RATE_HZ))
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -431,8 +434,9 @@ class VX2740Controller:
         # Voltage scale: ADC_MIDSCALE maps to 0; convert to signed
         waves_signed = waves.astype(np.float32) - ADC_MIDSCALE
 
-        # Baseline from pre-trigger region
-        baselines = waves_signed[:, :pre].mean(axis=1, keepdims=True)
+        # Use at most the earliest 2 us, before the signal approaches trigger.
+        baseline_samples = min(pre, MAX_BASELINE_SAMPLES)
+        baselines = waves_signed[:, :baseline_samples].mean(axis=1, keepdims=True)
         waves_bl  = waves_signed - baselines
 
         # Post-trigger window
